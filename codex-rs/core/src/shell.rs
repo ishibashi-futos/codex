@@ -7,8 +7,16 @@ pub struct ZshShell {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct BashShell {
+    shell_path: String,
+    bashrc_path: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum Shell {
     Zsh(ZshShell),
+    /// Linux/Unix: Bash with -lc
+    Bash(BashShell),
     /// Windows default: PowerShell with -NoProfile
     PowerShell,
     Unknown,
@@ -30,6 +38,24 @@ impl Shell {
 
                 if let Some(joined) = joined {
                     result.push(format!("source {} && ({joined})", zsh.zshrc_path));
+                } else {
+                    return None;
+                }
+                Some(result)
+            }
+            Shell::Bash(bash) => {
+                if !std::path::Path::new(&bash.bashrc_path).exists() {
+                    return None;
+                }
+
+                let mut result = vec![bash.shell_path.clone()];
+                result.push("-lc".to_string());
+
+                let joined = strip_bash_lc(&command)
+                    .or_else(|| shlex::try_join(command.iter().map(|s| s.as_str())).ok());
+
+                if let Some(joined) = joined {
+                    result.push(format!("source {} && ({joined})", bash.bashrc_path));
                 } else {
                     return None;
                 }
@@ -101,13 +127,38 @@ pub async fn default_user_shell() -> Shell {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub async fn default_user_shell() -> Shell {
+    use whoami;
+
+    let shell_path = std::env::var("SHELL").unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", whoami::username()));
+    if shell_path.ends_with("/zsh") {
+        Shell::Zsh(ZshShell {
+            shell_path,
+            zshrc_path: format!("{home}/.zshrc"),
+        })
+    } else if shell_path.ends_with("/bash") {
+        Shell::Bash(BashShell {
+            shell_path,
+            bashrc_path: format!("{home}/.bashrc"),
+        })
+    } else {
+        Shell::Unknown
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub async fn default_user_shell() -> Shell {
     // Prefer PowerShell to support common aliases like `ls`.
     Shell::PowerShell
 }
 
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+    not(target_os = "linux")
+))]
 pub async fn default_user_shell() -> Shell {
     Shell::Unknown
 }
@@ -216,6 +267,101 @@ mod tests {
                 .iter()
                 .map(|s| {
                     s.replace("ZSHRC_PATH", zshrc_path.to_str().unwrap())
+                        .to_string()
+                })
+                .collect();
+
+            assert_eq!(actual_cmd, Some(expected_cmd));
+            // Actually run the command and check output/exit code
+            let output = process_exec_tool_call(
+                ExecParams {
+                    command: actual_cmd.unwrap(),
+                    cwd: PathBuf::from(temp_home.path()),
+                    timeout_ms: None,
+                    env: HashMap::from([(
+                        "HOME".to_string(),
+                        temp_home.path().to_str().unwrap().to_string(),
+                    )]),
+                    with_escalated_permissions: None,
+                    justification: None,
+                },
+                SandboxType::None,
+                &SandboxPolicy::DangerFullAccess,
+                &None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(output.exit_code, 0, "input: {input:?} output: {output:?}");
+            if let Some(expected) = expected_output {
+                assert_eq!(
+                    output.stdout.text, expected,
+                    "input: {input:?} output: {output:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod bash_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_run_with_profile_bashrc_invocation() {
+        let shell_path = "/bin/bash";
+
+        let cases = vec![
+            (
+                vec!["myecho"],
+                vec![shell_path, "-lc", "source BASHRC_PATH && (myecho)"],
+                Some("It works!\n"),
+            ),
+            (
+                vec!["bash", "-lc", "echo 'single' \"double\""],
+                vec![
+                    shell_path,
+                    "-lc",
+                    "source BASHRC_PATH && (echo 'single' \"double\")",
+                ],
+                Some("single double\n"),
+            ),
+        ];
+        for (input, expected_cmd, expected_output) in cases {
+            use std::collections::HashMap;
+            use std::path::PathBuf;
+
+            use crate::exec::ExecParams;
+            use crate::exec::SandboxType;
+            use crate::exec::process_exec_tool_call;
+            use crate::protocol::SandboxPolicy;
+
+            // create a temp directory with a bashrc file in it
+            let temp_home = tempfile::tempdir().unwrap();
+            let bashrc_path = temp_home.path().join(".bashrc");
+            std::fs::write(
+                &bashrc_path,
+                r#"
+                    set -x
+                    function myecho {
+                        echo 'It works!'
+                    }
+                    "#,
+            )
+            .unwrap();
+            let shell = Shell::Bash(BashShell {
+                shell_path: shell_path.to_string(),
+                bashrc_path: bashrc_path.to_str().unwrap().to_string(),
+            });
+
+            let actual_cmd = shell
+                .format_default_shell_invocation(input.iter().map(|s| s.to_string()).collect());
+            let expected_cmd = expected_cmd
+                .iter()
+                .map(|s| {
+                    s.replace("BASHRC_PATH", bashrc_path.to_str().unwrap())
                         .to_string()
                 })
                 .collect();

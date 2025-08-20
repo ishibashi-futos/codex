@@ -9,6 +9,8 @@ pub struct ZshShell {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Shell {
     Zsh(ZshShell),
+    /// Windows default: PowerShell with -NoProfile
+    PowerShell,
     Unknown,
 }
 
@@ -32,6 +34,19 @@ impl Shell {
                     return None;
                 }
                 Some(result)
+            }
+            Shell::PowerShell => {
+                // Join args into a single command string for PowerShell.
+                let joined = strip_bash_lc(&command)
+                    .or_else(|| shlex::try_join(command.iter().map(|s| s.as_str())).ok());
+                joined.map(|j| {
+                    vec![
+                        "powershell".to_string(),
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        j,
+                    ]
+                })
             }
             Shell::Unknown => None,
         }
@@ -86,7 +101,13 @@ pub async fn default_user_shell() -> Shell {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub async fn default_user_shell() -> Shell {
+    // Prefer PowerShell to support common aliases like `ls`.
+    Shell::PowerShell
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub async fn default_user_shell() -> Shell {
     Shell::Unknown
 }

@@ -894,6 +894,43 @@ impl Session {
     }
 }
 
+#[cfg(test)]
+mod normalize_command_tests {
+    use super::normalize_command;
+
+    fn v(strings: &[&str]) -> Vec<String> {
+        strings.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn splits_single_string_with_args() {
+        let input = v(&["touch AGENTS.md"]);
+        let out = normalize_command(&input);
+        assert_eq!(out, v(&["touch", "AGENTS.md"]));
+    }
+
+    #[test]
+    fn preserves_single_token() {
+        let input = v(&["ls"]);
+        let out = normalize_command(&input);
+        assert_eq!(out, v(&["ls"]));
+    }
+
+    #[test]
+    fn preserves_multi_arg_list() {
+        let input = v(&["git", "status"]);
+        let out = normalize_command(&input);
+        assert_eq!(out, v(&["git", "status"]));
+    }
+
+    #[test]
+    fn handles_quotes_in_single_string() {
+        let input = v(&["echo 'hello world'"]);
+        let out = normalize_command(&input);
+        assert_eq!(out, v(&["echo", "hello world"]));
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         self.interrupt_task();
@@ -2010,9 +2047,26 @@ async fn handle_function_call(
     }
 }
 
+fn normalize_command(command: &[String]) -> Vec<String> {
+    if command.len() == 1 {
+        let s = &command[0];
+        if s.chars().any(char::is_whitespace)
+            && let Some(tokens) = shlex::split(s)
+            && !tokens.is_empty()
+        {
+            return tokens;
+        }
+    }
+    command.to_vec()
+}
+
 fn to_exec_params(params: ShellToolCallParams, turn_context: &TurnContext) -> ExecParams {
+    // Normalize the command vector so single-string commands like
+    // "touch AGENTS.md" are split into argv tokens for correct exec behavior.
+    let command = normalize_command(&params.command);
+
     ExecParams {
-        command: params.command,
+        command,
         cwd: turn_context.resolve_path(params.workdir.clone()),
         timeout_ms: params.timeout_ms,
         env: create_env(&turn_context.shell_environment_policy),

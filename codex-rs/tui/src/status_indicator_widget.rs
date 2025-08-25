@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::shimmer::shimmer_spans;
+use crate::tui::FrameRequester;
 
 // We render the live text using markdown so it visually matches the history
 // cells. Before rendering we strip any ANSI escape sequences to avoid writing
@@ -29,6 +30,8 @@ pub(crate) struct StatusIndicatorWidget {
     /// Latest text to display (truncated to the available width at render
     /// time).
     text: String,
+    /// Animated header text (defaults to "Working").
+    header: String,
 
     /// Animation state: reveal target `text` progressively like a typewriter.
     /// We compute the currently visible prefix length based on the current
@@ -39,18 +42,21 @@ pub(crate) struct StatusIndicatorWidget {
     reveal_len_at_base: usize,
     start_time: Instant,
     app_event_tx: AppEventSender,
+    frame_requester: FrameRequester,
 }
 
 impl StatusIndicatorWidget {
-    pub(crate) fn new(app_event_tx: AppEventSender) -> Self {
+    pub(crate) fn new(app_event_tx: AppEventSender, frame_requester: FrameRequester) -> Self {
         Self {
             text: String::from("waiting for model"),
+            header: String::from("Working"),
             last_target_len: 0,
             base_frame: 0,
             reveal_len_at_base: 0,
             start_time: Instant::now(),
 
             app_event_tx,
+            frame_requester,
         }
     }
 
@@ -90,6 +96,13 @@ impl StatusIndicatorWidget {
 
     pub(crate) fn interrupt(&self) {
         self.app_event_tx.send(AppEvent::CodexOp(Op::Interrupt));
+    }
+
+    /// Update the animated header label (left of the brackets).
+    pub(crate) fn update_header(&mut self, header: String) {
+        if self.header != header {
+            self.header = header;
+        }
     }
 
     /// Reset the animation and start revealing `text` from the beginning.
@@ -133,6 +146,15 @@ impl StatusIndicatorWidget {
         let since_start = self.start_time.elapsed();
         (since_start.as_millis() / 100) as usize
     }
+
+    /// Test-only helper to fast-forward the internal clock so animations
+    /// advance without sleeping.
+    #[cfg(test)]
+    pub(crate) fn test_fast_forward_frames(&mut self, frames: usize) {
+        let advance_ms = (frames as u64).saturating_mul(100);
+        // Move the start time into the past so `current_frame()` advances.
+        self.start_time = std::time::Instant::now() - std::time::Duration::from_millis(advance_ms);
+    }
 }
 
 impl WidgetRef for StatusIndicatorWidget {
@@ -143,13 +165,13 @@ impl WidgetRef for StatusIndicatorWidget {
         }
 
         // Schedule next animation frame.
-        self.app_event_tx
-            .send(AppEvent::ScheduleFrameIn(Duration::from_millis(100)));
+        self.frame_requester
+            .schedule_frame_in(Duration::from_millis(32));
         let idx = self.current_frame();
         let elapsed = self.start_time.elapsed().as_secs();
         let shown_now = self.current_shown_len(idx);
         let status_prefix: String = self.text.chars().take(shown_now).collect();
-        let animated_spans = shimmer_spans("Working");
+        let animated_spans = shimmer_spans(&self.header);
 
         // Plain rendering: no borders or padding so the live cell is visually indistinguishable from terminal scrollback.
         let inner_width = area.width as usize;
@@ -213,18 +235,18 @@ mod tests {
     use super::*;
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
-    use std::sync::mpsc::channel;
+    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn renders_without_left_border_or_padding() {
-        let (tx_raw, _rx) = channel::<AppEvent>();
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx);
+        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
         w.restart_with_text("Hello".to_string());
 
         let area = ratatui::layout::Rect::new(0, 0, 30, 1);
-        // Allow a short delay so the typewriter reveals the first character.
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        // Advance animation without sleeping.
+        w.test_fast_forward_frames(2);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         w.render_ref(area, &mut buf);
 
@@ -235,12 +257,12 @@ mod tests {
 
     #[test]
     fn working_header_is_present_on_last_line() {
-        let (tx_raw, _rx) = channel::<AppEvent>();
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx);
+        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
         w.restart_with_text("Hi".to_string());
-        // Ensure some frames elapse so we get a stable state.
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        // Advance animation without sleeping.
+        w.test_fast_forward_frames(2);
 
         let area = ratatui::layout::Rect::new(0, 0, 30, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);
@@ -256,11 +278,11 @@ mod tests {
 
     #[test]
     fn header_starts_at_expected_position() {
-        let (tx_raw, _rx) = channel::<AppEvent>();
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
-        let mut w = StatusIndicatorWidget::new(tx);
+        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
         w.restart_with_text("Hello".to_string());
-        std::thread::sleep(std::time::Duration::from_millis(120));
+        w.test_fast_forward_frames(2);
 
         let area = ratatui::layout::Rect::new(0, 0, 30, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);

@@ -23,19 +23,15 @@ pub use crate::server::run_login_server;
 pub use crate::token_data::TokenData;
 use crate::token_data::parse_id_token;
 
+mod auth_manager;
 mod pkce;
 mod server;
 mod token_data;
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
-
-#[derive(Clone, Debug, PartialEq, Copy, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMode {
-    ApiKey,
-    ChatGPT,
-}
+pub use auth_manager::AuthManager;
+pub use codex_protocol::mcp_protocol::AuthMode;
 
 #[derive(Debug, Clone)]
 pub struct CodexAuth {
@@ -242,7 +238,7 @@ fn load_auth(
         // "refreshable" even if we are using the API key for auth?
         match &tokens {
             Some(tokens) => {
-                if tokens.should_use_api_key(preferred_auth_method) {
+                if tokens.should_use_api_key(preferred_auth_method, tokens.is_openai_email()) {
                     return Ok(Some(CodexAuth::from_api_key(api_key)));
                 } else {
                     // Ignore the API key and fall through to ChatGPT auth.

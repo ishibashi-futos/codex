@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use codex_core::config::set_project_trusted;
-use codex_core::protocol::AskForApproval;
-use codex_core::protocol::SandboxPolicy;
+use codex_core::git_info::resolve_root_git_project_for_trust;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
@@ -22,9 +21,6 @@ use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
 
 use super::onboarding_screen::StepState;
-use crate::app::ChatWidgetArgs;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 pub(crate) struct TrustDirectoryWidget {
     pub codex_home: PathBuf,
@@ -33,11 +29,10 @@ pub(crate) struct TrustDirectoryWidget {
     pub selection: Option<TrustDirectorySelection>,
     pub highlighted: TrustDirectorySelection,
     pub error: Option<String>,
-    pub chat_widget_args: Arc<Mutex<ChatWidgetArgs>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TrustDirectorySelection {
+pub enum TrustDirectorySelection {
     Trust,
     DontTrust,
 }
@@ -150,17 +145,11 @@ impl StepStateProvider for TrustDirectoryWidget {
 
 impl TrustDirectoryWidget {
     fn handle_trust(&mut self) {
-        if let Err(e) = set_project_trusted(&self.codex_home, &self.cwd) {
+        let target =
+            resolve_root_git_project_for_trust(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        if let Err(e) = set_project_trusted(&self.codex_home, &target) {
             tracing::error!("Failed to set project trusted: {e:?}");
-            self.error = Some(e.to_string());
-            // self.error = Some("Failed to set project trusted".to_string());
-        }
-
-        // Update the in-memory chat config for this session to a more permissive
-        // policy suitable for a trusted workspace.
-        if let Ok(mut args) = self.chat_widget_args.lock() {
-            args.config.approval_policy = AskForApproval::OnRequest;
-            args.config.sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+            self.error = Some(format!("Failed to set trust for {}: {e}", target.display()));
         }
 
         self.selection = Some(TrustDirectorySelection::Trust);

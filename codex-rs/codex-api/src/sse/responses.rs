@@ -110,6 +110,15 @@ struct ResponseCompleted {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ResponsesResponse {
+    pub id: String,
+    #[serde(default)]
+    pub output: Vec<ResponseItem>,
+    #[serde(default)]
+    pub usage: Option<ResponseCompletedUsage>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ResponseDone {
     #[serde(default)]
     id: Option<String>,
@@ -118,7 +127,7 @@ struct ResponseDone {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponseCompletedUsage {
+pub struct ResponseCompletedUsage {
     input_tokens: i64,
     input_tokens_details: Option<ResponseCompletedInputTokensDetails>,
     output_tokens: i64,
@@ -169,6 +178,28 @@ impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+}
+
+pub fn parse_responses_response(body: &[u8]) -> Result<ResponsesResponse, ApiError> {
+    serde_json::from_slice(body).map_err(|err| {
+        ApiError::Stream(format!(
+            "failed to decode responses response: {err}; body: {}",
+            String::from_utf8_lossy(body)
+        ))
+    })
+}
+
+pub fn responses_response_to_events(response: ResponsesResponse) -> Vec<ResponseEvent> {
+    let mut events = response
+        .output
+        .into_iter()
+        .map(ResponseEvent::OutputItemDone)
+        .collect::<Vec<_>>();
+    events.push(ResponseEvent::Completed {
+        response_id: response.id,
+        token_usage: response.usage.map(Into::into),
+    });
+    events
 }
 
 #[derive(Debug)]
@@ -435,6 +466,7 @@ mod tests {
     use super::*;
     use assert_matches::assert_matches;
     use bytes::Bytes;
+    use codex_protocol::models::ContentItem;
     use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
     use futures::stream;
@@ -879,5 +911,54 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(35)));
+    }
+
+    #[test]
+    fn non_stream_response_to_events() {
+        let response = ResponsesResponse {
+            id: "resp-1".to_string(),
+            output: vec![ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "hello".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            }],
+            usage: Some(ResponseCompletedUsage {
+                input_tokens: 2,
+                input_tokens_details: None,
+                output_tokens: 3,
+                output_tokens_details: None,
+                total_tokens: 5,
+            }),
+        };
+
+        let events = responses_response_to_events(response);
+        assert_eq!(
+            events,
+            vec![
+                ResponseEvent::OutputItemDone(ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "hello".to_string(),
+                    }],
+                    end_turn: None,
+                    phase: None,
+                }),
+                ResponseEvent::Completed {
+                    response_id: "resp-1".to_string(),
+                    token_usage: Some(TokenUsage {
+                        input_tokens: 2,
+                        cached_input_tokens: 0,
+                        output_tokens: 3,
+                        reasoning_output_tokens: 0,
+                        total_tokens: 5,
+                    })
+                }
+            ]
+        );
     }
 }

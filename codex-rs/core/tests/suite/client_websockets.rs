@@ -794,6 +794,10 @@ fn websocket_provider(server: &WebSocketTestServer) -> ModelProviderInfo {
         stream_idle_timeout_ms: Some(5_000),
         requires_openai_auth: false,
         supports_websockets: true,
+        supports_streaming: true,
+        unsupported_params: Vec::new(),
+        supports_response_format: true,
+        supports_parallel_tool_calls: true,
     }
 }
 

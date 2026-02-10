@@ -490,10 +490,33 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "supports_parallel_tool_calls": {
+          "default": true,
+          "description": "Whether this provider supports parallel_tool_calls.",
+          "type": "boolean"
+        },
+        "supports_response_format": {
+          "default": true,
+          "description": "Whether this provider supports response_format (Chat Completions).",
+          "type": "boolean"
+        },
+        "supports_streaming": {
+          "default": true,
+          "description": "Whether this provider supports streaming responses.",
+          "type": "boolean"
+        },
         "supports_websockets": {
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
           "type": "boolean"
+        },
+        "unsupported_params": {
+          "default": [],
+          "description": "Request parameters that should be omitted for this provider.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "wire_api": {
           "allOf": [
@@ -1143,6 +1166,13 @@
           "description": "The Responses API exposed by OpenAI at `/v1/responses`.",
           "enum": [
             "responses"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The Chat Completions API exposed by OpenAI at `/v1/chat/completions`.",
+          "enum": [
+            "chat_completions"
           ],
           "type": "string"
         }

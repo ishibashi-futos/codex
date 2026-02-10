@@ -86,6 +86,10 @@ async fn retries_on_early_close() {
         stream_idle_timeout_ms: Some(2000),
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_streaming: true,
+        unsupported_params: Vec::new(),
+        supports_response_format: true,
+        supports_parallel_tool_calls: true,
     };
 
     let TestCodex { codex, .. } = test_codex()

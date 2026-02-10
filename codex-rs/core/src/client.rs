@@ -35,6 +35,14 @@ use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
 use crate::api_bridge::map_api_error;
 use crate::auth::UnauthorizedRecovery;
+use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
+use codex_api::ChatCompletionsFunctionCall as ApiChatCompletionsFunctionCall;
+use codex_api::ChatCompletionsJsonSchema as ApiChatCompletionsJsonSchema;
+use codex_api::ChatCompletionsMessage as ApiChatCompletionsMessage;
+use codex_api::ChatCompletionsRequestBuilder as ApiChatCompletionsRequestBuilder;
+use codex_api::ChatCompletionsResponseFormat as ApiChatCompletionsResponseFormat;
+use codex_api::ChatCompletionsStreamOptions as ApiChatCompletionsStreamOptions;
+use codex_api::ChatCompletionsToolCall as ApiChatCompletionsToolCall;
 use codex_api::CompactClient as ApiCompactClient;
 use codex_api::CompactionInput as ApiCompactionInput;
 use codex_api::MemoriesClient as ApiMemoriesClient;
@@ -64,6 +72,7 @@ use codex_otel::OtelManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -71,17 +80,20 @@ use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
+use futures::stream;
 use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
 use serde_json::Value;
+use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::debug;
 use tracing::warn;
 
 use crate::AuthManager;
@@ -733,6 +745,21 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         turn_metadata_header: Option<&str>,
     ) -> Result<ResponseStream> {
+        let stream_param_supported = provider_supports_param(&self.client.state.provider, "stream");
+        if !self.client.state.provider.supports_streaming || !stream_param_supported {
+            return self
+                .request_responses_api(
+                    prompt,
+                    model_info,
+                    otel_manager,
+                    effort,
+                    summary,
+                    turn_metadata_header,
+                    stream_param_supported,
+                )
+                .await;
+        }
+
         if let Some(path) = &*CODEX_RS_SSE_FIXTURE {
             warn!(path, "Streaming from fixture");
             let stream = codex_api::stream_from_fixture(
@@ -778,6 +805,230 @@ impl ModelClientSession {
             match stream_result {
                 Ok(stream) => {
                     return Ok(map_response_stream(stream, otel_manager.clone()));
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
+                    continue;
+                }
+                Err(err @ ApiError::Transport(TransportError::Http { status, .. }))
+                    if status.is_client_error() || status.is_server_error() =>
+                {
+                    return self
+                        .request_responses_api(
+                            prompt,
+                            model_info,
+                            otel_manager,
+                            effort,
+                            summary,
+                            turn_metadata_header,
+                            stream_param_supported,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_responses_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+        stream_param_supported: bool,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.auth_manager.clone();
+        let api_prompt = Self::build_responses_request(prompt)?;
+
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_telemetry = ModelClient::build_request_telemetry(otel_manager);
+            let compression = self.responses_request_compression(client_setup.auth.as_ref());
+            let api_provider = client_setup.api_provider.clone();
+
+            let client = ApiResponsesClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), None);
+
+            let options = self.build_responses_options(
+                prompt,
+                model_info,
+                effort,
+                summary,
+                turn_metadata_header,
+                compression,
+            );
+
+            let request = codex_api::ResponsesRequestBuilder::new(
+                &model_info.slug,
+                &api_prompt.instructions,
+                &api_prompt.input,
+            )
+            .tools(&api_prompt.tools)
+            .parallel_tool_calls(api_prompt.parallel_tool_calls)
+            .reasoning(options.reasoning)
+            .include(options.include)
+            .prompt_cache_key(options.prompt_cache_key)
+            .text(options.text)
+            .conversation(options.conversation_id)
+            .session_source(options.session_source)
+            .store_override(options.store_override)
+            .stream(stream_param_supported.then_some(false))
+            .extra_headers(options.extra_headers)
+            .compression(options.compression)
+            .build(&api_provider)
+            .map_err(map_api_error)?;
+
+            let events = client.request_events(request).await;
+            match events {
+                Ok(events) => {
+                    let api_stream = stream::iter(events.into_iter().map(Ok));
+                    return Ok(map_response_stream(api_stream, otel_manager.clone()));
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
+                    continue;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_chat_completions(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        turn_metadata_header: Option<&str>,
+    ) -> Result<ResponseStream> {
+        let _ = (effort, summary);
+        let stream_param_supported = provider_supports_param(&self.client.state.provider, "stream");
+        let can_stream = self.client.state.provider.supports_streaming && stream_param_supported;
+        let turn_metadata_header = parse_turn_metadata_header(turn_metadata_header);
+        let mut extra_headers = ApiHeaderMap::new();
+        if let Some(header_value) = turn_metadata_header.as_ref() {
+            extra_headers.insert(X_CODEX_TURN_METADATA_HEADER, header_value.clone());
+        }
+
+        if !can_stream {
+            return self
+                .request_chat_completions(
+                    prompt,
+                    model_info,
+                    otel_manager,
+                    extra_headers,
+                    stream_param_supported,
+                )
+                .await;
+        }
+
+        let auth_manager = self.client.state.auth_manager.clone();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(otel_manager);
+            let client = ApiChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+
+            let request = build_chat_request(
+                prompt,
+                &self.client.state.provider,
+                &model_info.slug,
+                Some(true),
+                true,
+            )?;
+
+            let stream_result = client.stream_request(request, extra_headers.clone()).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    return Ok(map_response_stream(stream, otel_manager.clone()));
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    handle_unauthorized(unauthorized_transport, &mut auth_recovery).await?;
+                    continue;
+                }
+                Err(err @ ApiError::Transport(TransportError::Http { status, .. }))
+                    if status.is_client_error() || status.is_server_error() =>
+                {
+                    return self
+                        .request_chat_completions(
+                            prompt,
+                            model_info,
+                            otel_manager,
+                            extra_headers,
+                            stream_param_supported,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(map_api_error(err)),
+            }
+        }
+    }
+
+    async fn request_chat_completions(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        otel_manager: &OtelManager,
+        extra_headers: ApiHeaderMap,
+        stream_param_supported: bool,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.auth_manager.clone();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(super::auth::AuthManager::unauthorized_recovery);
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_telemetry = ModelClient::build_request_telemetry(otel_manager);
+            let client = ApiChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), None);
+
+            let request = build_chat_request(
+                prompt,
+                &self.client.state.provider,
+                &model_info.slug,
+                stream_param_supported.then_some(false),
+                false,
+            )?;
+
+            let events = client.request_events(request, extra_headers.clone()).await;
+            match events {
+                Ok(events) => {
+                    let api_stream = stream::iter(events.into_iter().map(Ok));
+                    return Ok(map_response_stream(api_stream, otel_manager.clone()));
                 }
                 Err(ApiError::Transport(
                     unauthorized_transport @ TransportError::Http { status, .. },
@@ -914,8 +1165,10 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.wire_api;
         match wire_api {
             WireApi::Responses => {
-                let websocket_enabled =
-                    self.client.responses_websocket_enabled() && !self.client.disable_websockets();
+                let websocket_enabled = self.client.responses_websocket_enabled()
+                    && !self.client.disable_websockets()
+                    && self.client.state.provider.supports_streaming
+                    && provider_supports_param(&self.client.state.provider, "stream");
 
                 if websocket_enabled {
                     match self
@@ -937,6 +1190,17 @@ impl ModelClientSession {
                 }
 
                 self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    otel_manager,
+                    effort,
+                    summary,
+                    turn_metadata_header,
+                )
+                .await
+            }
+            WireApi::ChatCompletions => {
+                self.stream_chat_completions(
                     prompt,
                     model_info,
                     otel_manager,
@@ -982,6 +1246,187 @@ fn build_api_prompt(prompt: &Prompt, instructions: String, tools_json: Vec<Value
         parallel_tool_calls: prompt.parallel_tool_calls,
         output_schema: prompt.output_schema.clone(),
     }
+}
+
+fn provider_supports_param(provider: &ModelProviderInfo, param: &str) -> bool {
+    !provider
+        .unsupported_params
+        .iter()
+        .any(|value| value == param)
+}
+
+fn build_chat_messages(prompt: &Prompt) -> Vec<ApiChatCompletionsMessage> {
+    let mut messages = Vec::new();
+
+    if !prompt.base_instructions.text.trim().is_empty() {
+        messages.push(ApiChatCompletionsMessage {
+            role: "system".to_string(),
+            content: Some(Value::String(prompt.base_instructions.text.clone())),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    for item in prompt.get_formatted_input() {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let content = if content.is_empty() {
+                    Some(Value::String(String::new()))
+                } else {
+                    let mut parts = Vec::new();
+                    let mut text_only = true;
+                    for item in &content {
+                        match item {
+                            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                                parts.push(json!({"type": "text", "text": text}));
+                            }
+                            ContentItem::InputImage { image_url } => {
+                                text_only = false;
+                                parts.push(
+                                    json!({"type": "image_url", "image_url": {"url": image_url}}),
+                                );
+                            }
+                        }
+                    }
+
+                    if text_only && parts.len() == 1 {
+                        parts
+                            .first()
+                            .and_then(|part| part.get("text").and_then(Value::as_str))
+                            .map(|text| Value::String(text.to_string()))
+                    } else {
+                        Some(Value::Array(parts))
+                    }
+                };
+                messages.push(ApiChatCompletionsMessage {
+                    role,
+                    content,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => {
+                let tool_call = ApiChatCompletionsToolCall {
+                    id: Some(call_id),
+                    r#type: "function".to_string(),
+                    function: ApiChatCompletionsFunctionCall { name, arguments },
+                };
+                messages.push(ApiChatCompletionsMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![tool_call]),
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::CustomToolCall {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
+                let tool_call = ApiChatCompletionsToolCall {
+                    id: Some(call_id),
+                    r#type: "function".to_string(),
+                    function: ApiChatCompletionsFunctionCall {
+                        name,
+                        arguments: input,
+                    },
+                };
+                messages.push(ApiChatCompletionsMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![tool_call]),
+                    tool_call_id: None,
+                });
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let content = output.body.to_text().unwrap_or_default();
+                messages.push(ApiChatCompletionsMessage {
+                    role: "tool".to_string(),
+                    content: Some(Value::String(content)),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+            }
+            ResponseItem::CustomToolCallOutput { call_id, output } => {
+                messages.push(ApiChatCompletionsMessage {
+                    role: "tool".to_string(),
+                    content: Some(Value::String(output)),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+            }
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::Compaction { .. }
+            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::LocalShellCall { .. } => {
+                debug!("skipping responses-only item while building chat messages");
+            }
+            ResponseItem::Other => {
+                debug!("skipping unknown response item while building chat messages");
+            }
+        }
+    }
+
+    messages
+}
+
+fn build_chat_request(
+    prompt: &Prompt,
+    provider: &ModelProviderInfo,
+    model: &str,
+    stream: Option<bool>,
+    include_stream_options: bool,
+) -> Result<codex_api::ChatCompletionsRequest> {
+    let messages = build_chat_messages(prompt);
+    let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
+    let tool_choice = (!tools_json.is_empty()).then(|| "auto".to_string());
+    let parallel_tool_calls = if provider.supports_parallel_tool_calls && !tools_json.is_empty() {
+        Some(prompt.parallel_tool_calls)
+    } else {
+        None
+    };
+
+    let response_format = if provider.supports_response_format
+        && provider_supports_param(provider, "response_format")
+    {
+        prompt
+            .output_schema
+            .as_ref()
+            .map(|schema| ApiChatCompletionsResponseFormat::JsonSchema {
+                json_schema: ApiChatCompletionsJsonSchema {
+                    name: "codex_output_schema".to_string(),
+                    schema: schema.clone(),
+                    strict: true,
+                },
+            })
+    } else {
+        None
+    };
+
+    let stream_options = if include_stream_options {
+        Some(ApiChatCompletionsStreamOptions {
+            include_usage: true,
+        })
+    } else {
+        None
+    };
+
+    ApiChatCompletionsRequestBuilder::new(model, &messages)
+        .tools(&tools_json)
+        .tool_choice(tool_choice)
+        .parallel_tool_calls(parallel_tool_calls)
+        .response_format(response_format)
+        .stream(stream)
+        .stream_options(stream_options)
+        .build()
+        .map_err(map_api_error)
 }
 
 /// Parses per-turn metadata into an HTTP header value.

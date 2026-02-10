@@ -28,7 +28,7 @@ const MAX_STREAM_MAX_RETRIES: u64 = 100;
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
-const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"chat_completions\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
 pub(crate) const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub(crate) const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -39,6 +39,9 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// The Chat Completions API exposed by OpenAI at `/v1/chat/completions`.
+    #[serde(rename = "chat_completions")]
+    ChatCompletions,
 }
 
 impl<'de> Deserialize<'de> for WireApi {
@@ -49,8 +52,12 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "chat_completions" => Ok(Self::ChatCompletions),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "chat_completions"],
+            )),
         }
     }
 }
@@ -112,6 +119,22 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+
+    /// Whether this provider supports streaming responses.
+    #[serde(default = "default_supports_streaming")]
+    pub supports_streaming: bool,
+
+    /// Request parameters that should be omitted for this provider.
+    #[serde(default)]
+    pub unsupported_params: Vec<String>,
+
+    /// Whether this provider supports response_format (Chat Completions).
+    #[serde(default = "default_supports_response_format")]
+    pub supports_response_format: bool,
+
+    /// Whether this provider supports parallel_tool_calls.
+    #[serde(default = "default_supports_parallel_tool_calls")]
+    pub supports_parallel_tool_calls: bool,
 }
 
 impl ModelProviderInfo {
@@ -257,6 +280,10 @@ impl ModelProviderInfo {
             stream_idle_timeout_ms: None,
             requires_openai_auth: true,
             supports_websockets: true,
+            supports_streaming: true,
+            unsupported_params: Vec::new(),
+            supports_response_format: true,
+            supports_parallel_tool_calls: true,
         }
     }
 
@@ -331,7 +358,23 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_streaming: true,
+        unsupported_params: Vec::new(),
+        supports_response_format: true,
+        supports_parallel_tool_calls: true,
     }
+}
+
+fn default_supports_streaming() -> bool {
+    true
+}
+
+fn default_supports_response_format() -> bool {
+    true
+}
+
+fn default_supports_parallel_tool_calls() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -360,6 +403,10 @@ base_url = "http://localhost:11434/v1"
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_streaming: true,
+            unsupported_params: Vec::new(),
+            supports_response_format: true,
+            supports_parallel_tool_calls: true,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -391,6 +438,10 @@ query_params = { api-version = "2025-04-01-preview" }
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_streaming: true,
+            unsupported_params: Vec::new(),
+            supports_response_format: true,
+            supports_parallel_tool_calls: true,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -425,6 +476,10 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_streaming: true,
+            unsupported_params: Vec::new(),
+            supports_response_format: true,
+            supports_parallel_tool_calls: true,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();

@@ -2771,6 +2771,53 @@ profile = "project"
     }
 
     #[test]
+    fn model_provider_accepts_chat_completions_wire_api() {
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[model_providers.chatty]
+name = "Chatty"
+base_url = "https://example.com/v1"
+wire_api = "chat_completions"
+"#,
+        )
+        .expect("config should parse");
+
+        let provider = cfg
+            .model_providers
+            .get("chatty")
+            .expect("chatty provider should exist");
+        assert_eq!(provider.wire_api, crate::WireApi::ChatCompletions);
+    }
+
+    #[test]
+    fn model_provider_support_flags_deserialize() {
+        let cfg: ConfigToml = toml::from_str(
+            r#"
+[model_providers.azure-gateway]
+name = "Azure Gateway"
+base_url = "https://example.com/v1"
+supports_streaming = false
+unsupported_params = ["stream", "response_format"]
+supports_response_format = false
+supports_parallel_tool_calls = false
+"#,
+        )
+        .expect("config should parse");
+
+        let provider = cfg
+            .model_providers
+            .get("azure-gateway")
+            .expect("azure-gateway provider should exist");
+        assert!(!provider.supports_streaming);
+        assert_eq!(
+            provider.unsupported_params,
+            vec!["stream".to_string(), "response_format".to_string()]
+        );
+        assert!(!provider.supports_response_format);
+        assert!(!provider.supports_parallel_tool_calls);
+    }
+
+    #[test]
     fn config_honors_explicit_file_oauth_store_mode() -> std::io::Result<()> {
         let codex_home = TempDir::new()?;
         let cfg = ConfigToml {
@@ -3949,6 +3996,10 @@ model_verbosity = "high"
             stream_idle_timeout_ms: Some(300_000),
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_streaming: true,
+            unsupported_params: Vec::new(),
+            supports_response_format: true,
+            supports_parallel_tool_calls: true,
         };
         let model_provider_map = {
             let mut model_provider_map = built_in_model_providers();

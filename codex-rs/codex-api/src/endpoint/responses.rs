@@ -1,6 +1,7 @@
 use crate::auth::AuthProvider;
 use crate::common::Prompt as ApiPrompt;
 use crate::common::Reasoning;
+use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::TextControls;
 use crate::endpoint::session::EndpointSession;
@@ -9,6 +10,8 @@ use crate::provider::Provider;
 use crate::requests::ResponsesRequest;
 use crate::requests::ResponsesRequestBuilder;
 use crate::requests::responses::Compression;
+use crate::sse::parse_responses_response;
+use crate::sse::responses_response_to_events;
 use crate::sse::spawn_response_stream;
 use crate::telemetry::SseTelemetry;
 use codex_client::HttpTransport;
@@ -112,6 +115,44 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
         self.stream_request(request, turn_state).await
     }
 
+    #[instrument(level = "trace", skip_all, err)]
+    pub async fn request_prompt_events(
+        &self,
+        model: &str,
+        prompt: &ApiPrompt,
+        options: ResponsesOptions,
+    ) -> Result<Vec<ResponseEvent>, ApiError> {
+        let ResponsesOptions {
+            reasoning,
+            include,
+            prompt_cache_key,
+            text,
+            store_override,
+            conversation_id,
+            session_source,
+            extra_headers,
+            compression,
+            turn_state: _,
+        } = options;
+
+        let request = ResponsesRequestBuilder::new(model, &prompt.instructions, &prompt.input)
+            .tools(&prompt.tools)
+            .parallel_tool_calls(prompt.parallel_tool_calls)
+            .reasoning(reasoning)
+            .include(include)
+            .prompt_cache_key(prompt_cache_key)
+            .text(text)
+            .conversation(conversation_id)
+            .session_source(session_source)
+            .store_override(store_override)
+            .stream(Some(false))
+            .extra_headers(extra_headers)
+            .compression(compression)
+            .build(self.session.provider())?;
+
+        self.request_events(request).await
+    }
+
     fn path() -> &'static str {
         "responses"
     }
@@ -151,5 +192,29 @@ impl<T: HttpTransport, A: AuthProvider> ResponsesClient<T, A> {
             self.sse_telemetry.clone(),
             turn_state,
         ))
+    }
+
+    pub async fn request_events(
+        &self,
+        request: ResponsesRequest,
+    ) -> Result<Vec<ResponseEvent>, ApiError> {
+        let request_compression = match request.compression {
+            Compression::None => RequestCompression::None,
+            Compression::Zstd => RequestCompression::Zstd,
+        };
+        let response = self
+            .session
+            .execute_with(
+                Method::POST,
+                Self::path(),
+                request.headers,
+                Some(request.body),
+                |req| {
+                    req.compression = request_compression;
+                },
+            )
+            .await?;
+        let parsed = parse_responses_response(&response.body)?;
+        Ok(responses_response_to_events(parsed))
     }
 }

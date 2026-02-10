@@ -65,7 +65,7 @@ pub struct MemoryTraceSummaryOutput {
     pub memory_summary: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ResponseEvent {
     Created,
     OutputItemDone(ResponseItem),
@@ -160,7 +160,8 @@ pub struct ResponsesApiRequest<'a> {
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,
     pub store: bool,
-    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     pub include: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,

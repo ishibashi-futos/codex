@@ -39,6 +39,7 @@ pub struct ResponsesRequestBuilder<'a> {
     conversation_id: Option<String>,
     session_source: Option<SessionSource>,
     store_override: Option<bool>,
+    stream: Option<bool>,
     headers: HeaderMap,
     compression: Compression,
 }
@@ -49,6 +50,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
             model: Some(model),
             instructions: Some(instructions),
             input: Some(input),
+            stream: Some(true),
             ..Default::default()
         }
     }
@@ -98,6 +100,11 @@ impl<'a> ResponsesRequestBuilder<'a> {
         self
     }
 
+    pub fn stream(mut self, stream: Option<bool>) -> Self {
+        self.stream = stream;
+        self
+    }
+
     pub fn extra_headers(mut self, headers: HeaderMap) -> Self {
         self.headers = headers;
         self
@@ -133,7 +140,7 @@ impl<'a> ResponsesRequestBuilder<'a> {
             parallel_tool_calls: self.parallel_tool_calls,
             reasoning: self.reasoning,
             store,
-            stream: true,
+            stream: self.stream,
             include: self.include,
             prompt_cache_key: self.prompt_cache_key,
             text: self.text,

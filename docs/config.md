@@ -6,6 +6,32 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
+## Model Providers
+
+You can configure custom providers under `model_providers` in `config.toml`. For Chat Completions
+compatibility, set `wire_api = "chat_completions"`. The legacy `wire_api = "chat"` remains
+unsupported.
+
+Example:
+
+```toml
+[model_providers.my-gateway]
+name = "My Gateway"
+base_url = "https://example.com/v1"
+wire_api = "chat_completions"
+supports_streaming = false
+unsupported_params = ["stream", "response_format"]
+supports_response_format = false
+supports_parallel_tool_calls = false
+```
+
+Field notes:
+
+- `supports_streaming` controls whether Codex will attempt streaming or fall back to non-stream.
+- `unsupported_params` lists request parameters to omit (for example `stream` or `response_format`).
+- `supports_response_format` disables `response_format` when a provider does not support it.
+- `supports_parallel_tool_calls` disables `parallel_tool_calls` when a provider does not support it.
+
 ## Connecting to MCP servers
 
 Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:
